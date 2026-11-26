@@ -1,0 +1,711 @@
+package main;
+import "io";
+import "os";
+import "os/exec";
+import "term";
+import "term/tui";
+
+useTUI: bool;
+
+func interactiveTUI() bool {
+    inFile := os.Stdin();
+    if (inFile.hasError()) return false;
+    outFile := os.Stdout();
+    if (outFile.hasError()) return false;
+    inTerm := term.IsTerminal(inFile.unwrap());
+    if (inTerm.hasError() || !inTerm.unwrap()) return false;
+    outTerm := term.IsTerminal(outFile.unwrap());
+    if (outTerm.hasError() || !outTerm.unwrap()) return false;
+    return true;
+}
+
+func trimLastChar(text string) string {
+    if (len(text) == 0) return "";
+    end := len(text) - 1;
+    for (end > 0 && (((text[end] -> u8) -> int) & 192) == 128) end--;
+    return text[:end];
+}
+
+func editTextInput(text string, event tui.KeyMsg) string {
+    if (event.Key == "backspace") return trimLastChar(text);
+    if (event.Key == "ctrl+u") return "";
+    if (event.Key == "space") return text + " ";
+    if (event.Key == "rune" && !event.Alt) return text + event.Text;
+    return text;
+}
+
+func printSection(step int, total int, title string) {
+    if (total > 0) {
+        io.Println("\n\x1b[1;36m[" + io.Sprint(step) + "/" + io.Sprint(total) + "]\x1b[0m \x1b[1m" + title + "\x1b[0m");
+    } else {
+        io.Println("\n\x1b[1m" + title + "\x1b[0m");
+    }
+}
+
+func renderOptionRow(selected bool, index int, label string, detail string, disabled bool) string {
+    prefix := selected ? "\x1b[1;36m  ❯ \x1b[0m" : "    ";
+    num := io.Sprint(index) + ". ";
+    if (disabled) {
+        line := prefix + "\x1b[2m" + num + label;
+        if (detail != "") line += "  (" + detail + ")";
+        return line + "\x1b[0m\n";
+    }
+    if (selected) {
+        line := prefix + "\x1b[1;32m" + num + label + "\x1b[0m";
+        if (detail != "") line += "  \x1b[36m" + detail + "\x1b[0m";
+        return line + "\n";
+    }
+    line := prefix + num + label;
+    if (detail != "") line += "  \x1b[2m" + detail + "\x1b[0m";
+    return line + "\n";
+}
+
+// Inline single-choice list selector (no alt screen).
+struct selectOption {
+    label string;
+    detail string;
+}
+
+struct selectModel {
+    prompt string;
+    options []selectOption;
+    cursor int;
+    confirmed bool;
+    cancelled bool;
+}
+
+func (model *selectModel) Init() tui.Cmd { return tui.NoCmd; }
+
+func (model *selectModel) Update(message tui.Msg) (tui.Model, tui.Cmd) {
+    switch (event := message.(type)) {
+        case tui.EOFMsg:
+            model.cancelled = true;
+            return model, tui.Quit;
+        case tui.MouseMsg:
+            if (event.Action == "scroll") {
+                if (event.Button == "up" && model.cursor > 0) model.cursor--;
+                if (event.Button == "down" && model.cursor + 1 < len(model.options)) model.cursor++;
+            }
+        case tui.KeyMsg:
+            if (event.Key == "ctrl+c" || event.Text == "q" || event.Key == "esc") {
+                model.cancelled = true;
+                return model, tui.Quit;
+            }
+            if ((event.Key == "up" || event.Text == "k") && model.cursor > 0) {
+                model.cursor--;
+            } else if ((event.Key == "down" || event.Text == "j") && model.cursor + 1 < len(model.options)) {
+                model.cursor++;
+            } else if (event.Key == "home") {
+                model.cursor = 0;
+            } else if (event.Key == "end" && len(model.options) > 0) {
+                model.cursor = len(model.options) - 1;
+            } else if (event.Key == "rune" && !event.Alt && len(event.Text) == 1 && event.Text[0] >= '1' && event.Text[0] <= '9') {
+                idx := ((event.Text[0] - '1') -> int);
+                if (idx >= 0 && idx < len(model.options)) {
+                    model.cursor = idx;
+                    model.confirmed = true;
+                    return model, tui.Quit;
+                }
+            } else if (event.Key == "enter") {
+                model.confirmed = true;
+                return model, tui.Quit;
+            }
+    }
+    return model, tui.NoCmd;
+}
+
+func (model *selectModel) View() string {
+    out := "";
+    if (model.prompt != "") out += "  " + model.prompt + "\n";
+    for (i, opt := range model.options) {
+        out += renderOptionRow(i == model.cursor, i + 1, opt.label, opt.detail, false);
+    }
+    out += "\x1b[2m  ↑/↓ Navigate · 1-" + io.Sprint(len(model.options)) + " Select · Enter Confirm · Ctrl+C Cancel\x1b[0m";
+    return out;
+}
+
+func runSelectTUI(prompt string, options []selectOption, initial int) int {
+    model := selectModel{prompt: prompt, options: options, cursor: initial};
+    program := tui.NewProgram(&model, tui.Options{AltScreen: false, Mouse: true});
+    program.Run().unwrap();
+    require(model.confirmed && !model.cancelled, "installation cancelled");
+    return model.cursor;
+}
+
+// Inline text input prompt with validation (no alt screen).
+struct inputModel {
+    prompt string;
+    value string;
+    mode string;     // "path" or "exact"
+    expected string; // used when mode == "exact"
+    normalized string;
+    err string;
+    confirmed bool;
+    cancelled bool;
+}
+
+func (model *inputModel) Init() tui.Cmd { return tui.NoCmd; }
+
+func (model *inputModel) Update(message tui.Msg) (tui.Model, tui.Cmd) {
+    switch (event := message.(type)) {
+        case tui.EOFMsg:
+            model.cancelled = true;
+            return model, tui.Quit;
+        case tui.KeyMsg:
+            if (event.Key == "ctrl+c" || event.Key == "esc") {
+                model.cancelled = true;
+                return model, tui.Quit;
+            }
+            if (event.Key == "enter") {
+                trimmed := trim(model.value);
+                if (model.mode == "path") {
+                    normalized, err := tryNormalize(trimmed);
+                    if (err != "") { model.err = err; return model, tui.NoCmd; }
+                    model.normalized = normalized;
+                    model.confirmed = true;
+                    return model, tui.Quit;
+                }
+                if (model.mode == "exact") {
+                    if (trimmed != model.expected) {
+                        model.err = "Input must exactly match: " + model.expected;
+                        return model, tui.NoCmd;
+                    }
+                    model.confirmed = true;
+                    return model, tui.Quit;
+                }
+                model.confirmed = true;
+                return model, tui.Quit;
+            }
+            model.value = editTextInput(model.value, event);
+            model.err = "";
+    }
+    return model, tui.NoCmd;
+}
+
+func (model *inputModel) View() string {
+    out := "  " + model.prompt + "\n";
+    out += "  \x1b[1;36m> \x1b[0m" + model.value + "\x1b[7m \x1b[0m";
+    if (model.err != "") out += "\n\x1b[31m  Error: " + model.err + "\x1b[0m";
+    out += "\n\x1b[2m  Enter Confirm · Ctrl+U Clear · Esc/Ctrl+C Cancel\x1b[0m";
+    return out;
+}
+
+func runPathInputTUI() string {
+    model := inputModel{
+        prompt: "Full installation directory (including ocean folder):",
+        mode: "path"
+    };
+    program := tui.NewProgram(&model, tui.Options{AltScreen: false, Mouse: false});
+    program.Run().unwrap();
+    require(model.confirmed && !model.cancelled, "installation cancelled");
+    return model.normalized;
+}
+
+func runReplaceInputTUI(destination string) {
+    expected := "remove " + destination;
+    model := inputModel{
+        prompt: "Type \x1b[1m" + expected + "\x1b[0m to remove and replace this installation:",
+        mode: "exact",
+        expected: expected
+    };
+    program := tui.NewProgram(&model, tui.Options{AltScreen: false, Mouse: false});
+    program.Run().unwrap();
+    require(model.confirmed && !model.cancelled, "installation cancelled; existing directory preserved");
+}
+
+// Inline yes/no confirmation prompt (no alt screen).
+struct confirmModel {
+    title string;
+    detail string;
+    selected bool;
+    decided bool;
+    cancelled bool;
+}
+
+func (model *confirmModel) Init() tui.Cmd { return tui.NoCmd; }
+
+func (model *confirmModel) Update(message tui.Msg) (tui.Model, tui.Cmd) {
+    switch (event := message.(type)) {
+        case tui.EOFMsg:
+            model.cancelled = true;
+            return model, tui.Quit;
+        case tui.KeyMsg:
+            if (event.Key == "ctrl+c" || event.Key == "esc") { model.cancelled = true; return model, tui.Quit; }
+            if (event.Key == "left" || event.Key == "right" || event.Key == "up" || event.Key == "down" || event.Key == "tab" || event.Text == "h" || event.Text == "l") {
+                model.selected = !model.selected;
+            } else if (event.Text == "y" || event.Text == "Y") {
+                model.selected = true; model.decided = true; return model, tui.Quit;
+            } else if (event.Text == "n" || event.Text == "N") {
+                model.selected = false; model.decided = true; return model, tui.Quit;
+            } else if (event.Key == "enter") {
+                model.decided = true; return model, tui.Quit;
+            }
+    }
+    return model, tui.NoCmd;
+}
+
+func (model *confirmModel) View() string {
+    out := "\x1b[1;36m  ? \x1b[0m\x1b[1m" + model.title + "\x1b[0m\n";
+    if (model.detail != "") out += "    \x1b[2m" + model.detail + "\x1b[0m\n";
+    yesBtn := model.selected ? "\x1b[1;32m❯ Yes\x1b[0m" : "\x1b[2m  Yes\x1b[0m";
+    noBtn := !model.selected ? "\x1b[1;32m❯ No\x1b[0m" : "\x1b[2m  No\x1b[0m";
+    out += "    " + yesBtn + "    " + noBtn + "   \x1b[2m(←/→ Toggle · y/n · Enter Confirm)\x1b[0m";
+    return out;
+}
+
+func confirmPromptDefault(title string, detail string, defaultYes bool) bool {
+    if (!useTUI) {
+        if (detail != "") io.Println(detail);
+        return yes(title);
+    }
+    model := confirmModel{title: title, detail: detail, selected: defaultYes};
+    program := tui.NewProgram(&model, tui.Options{AltScreen: false, Mouse: true});
+    program.Run().unwrap();
+    return model.decided && !model.cancelled && model.selected;
+}
+
+func confirmPrompt(title string, detail string) bool {
+    return confirmPromptDefault(title, detail, false);
+}
+
+// Section-by-section inline setup flow (no alt screen).
+func runSetupTUI() (map[string]any, string) {
+    io.Println("\x1b[1;36mOcean Installer\x1b[0m \x1b[2m(" + architecture + "-" + platform + ") · Ctrl+C cancels\x1b[0m");
+    io.Println("\x1b[2m──────────────────────────────────────────────────────────\x1b[0m");
+    sys, usr := defaults();
+    installed := exec.LookPath("ocean");
+    if (!installed.hasError()) {
+        io.Println("\x1b[33mCaution: Ocean is already on PATH at " + installed.unwrap() + "\x1b[0m");
+    }
+    for (_, path := range []string{sys, usr}) {
+        if (exists(path)) {
+            io.Println("\x1b[2mExisting directory: " + path + "\x1b[0m");
+            for (_, line := range describeLines(path)) io.Println("\x1b[2m  " + line + "\x1b[0m");
+        }
+    }
+
+    // Step 1: Installation Location
+    printSection(1, 3, "Installation Location");
+    scope := runSelectTUI("Choose where to install Ocean:", []selectOption{
+        selectOption{label: "System-wide", detail: sys},
+        selectOption{label: "Current user", detail: usr},
+        selectOption{label: "Custom directory", detail: "specify an absolute path"}
+    }, 0);
+    destination := scope == 0 ? sys : usr;
+    global := scope == 0;
+    if (scope == 2) {
+        destination = runPathInputTUI();
+        global = confirmPromptDefault("Configure PATH for all users?", "System-wide PATH requires administrator permissions.", false);
+    } else {
+        destination = normalize(destination);
+    }
+
+    present := exists(destination);
+    if (present) {
+        printSection(0, 0, "Confirm Replacement");
+        io.Println("  Existing directory: \x1b[1m" + destination + "\x1b[0m");
+        for (_, line := range describeLines(destination)) io.Println("    \x1b[2m" + line + "\x1b[0m");
+        io.Println("\x1b[33m  Caution: replacement removes ALL directory contents after downloads validate.\x1b[0m");
+        runReplaceInputTUI(destination);
+    }
+
+    // Step 2: Dependencies
+    printSection(2, 3, "Dependencies");
+    io.Println("  \x1b[2mClang, libffi, libcurl, and native link/development libraries.\x1b[0m");
+    depMode := "";
+    depManager := "";
+    depMsys := "";
+    for (;;) {
+        depChoice := runSelectTUI("Choose how to handle dependencies:", []selectOption{
+            selectOption{label: "Skip", detail: "use existing dependencies on this system"},
+            selectOption{label: "System package manager", detail: "install system-wide via OS package manager"},
+            selectOption{label: "Toolchain bundle", detail: "install matching Clang & libraries in Ocean prefix"}
+        }, 0);
+        if (depChoice == 0) { depMode = "skip"; break; }
+        if (depChoice == 2) { depMode = "bundle"; break; }
+        manager, msys, err := checkSystemDependencyManager();
+        if (err != "") {
+            io.Println("\x1b[31m  Error: " + err + "\x1b[0m");
+            continue;
+        }
+        io.Println("\x1b[33m  System dependency installation uses " + manager + ". It may update system packages");
+        io.Println("  and needs administrator permission on Linux/Windows. Changes cannot be rolled back.\x1b[0m");
+        if (confirmPrompt("Allow dependency package installation?", "")) {
+            depMode = "system";
+            depManager = manager;
+            depMsys = msys;
+            break;
+        }
+        io.Println("\x1b[2m  System package installation declined. Choose another dependency option or Ctrl+C to cancel.\x1b[0m");
+    }
+
+    // Review section
+    plan := pathPlan(destination, global);
+    plan["replace"] = present;
+    plan["dependencies"] = depMode;
+    if (depMode == "system") {
+        plan["manager"] = depManager;
+        if (depMsys != "") plan["msys"] = depMsys;
+    }
+    printSection(0, 0, "Review Configuration");
+    io.Println("  Destination:   \x1b[1m" + destination + "\x1b[0m" + (present ? " \x1b[33m(replaces existing)\x1b[0m" : ""));
+    io.Println("  PATH scope:    " + (global ? "All users (system-wide)" : "Current user"));
+    if (platform == "windows") {
+        io.Println("  PATH config:   \x1b[2m" + (global ? "Windows Machine PATH" : "Windows User PATH") + "\x1b[0m");
+    } else {
+        for (_, raw := range array(plan["entries"])) io.Println("  PATH file:     \x1b[2m" + text(object(raw)["path"]) + "\x1b[0m");
+    }
+    depDesc := depMode == "skip" ? "Skip (use existing)" : (depMode == "bundle" ? "Toolchain bundle in Ocean prefix" : "System package manager (" + depManager + ")");
+    io.Println("  Dependencies:  " + depDesc);
+    require(confirmPromptDefault("Continue with these installation and PATH settings?", "", true), "installation cancelled");
+    return plan, depMode;
+}
+
+// Inline scrollable version & channel selector with fuzzy search bar (no alt screen).
+struct versionOption {
+    label string;
+    detail string;
+    releaseIndex int;
+    available bool;
+}
+
+struct versionModel {
+    options []versionOption;
+    filtered []int;
+    queryRunes []string;
+    searchCursor int;
+    searchScroll int;
+    cursor int;
+    scroll int;
+    width int;
+    height int;
+    err string;
+    confirmed bool;
+    cancelled bool;
+}
+
+func asciiLower(text string) string {
+    bytes := text -> []i8;
+    out := []i8{};
+    for (_, b := range bytes) {
+        if (b >= 'A' && b <= 'Z') out.append((b + 32) -> i8);
+        else out.append(b);
+    }
+    return out -> string;
+}
+
+func minInt(a int, b int) int { return a < b ? a : b; }
+
+// Fuzzy subsequence match with bounded edit tolerance (substitutions/deletions in query).
+// Returns (matched, score) where lower score is a better match.
+func fuzzyScore(query string, target string) (bool, int) {
+    q := asciiLower(trim(query));
+    if (q == "") return true, 0;
+    t := asciiLower(target);
+    m := len(q);
+    n := len(t);
+    if (n == 0) return false, 0;
+    sub := index(t, q);
+    if (sub >= 0) {
+        // Exact substring match; prefer earlier and tighter matches.
+        return true, sub * 2 + (n - m);
+    }
+    maxEdits := m <= 3 ? 0 : (m <= 7 ? 1 : 2);
+    // DP over query prefix length i: prev[i] = min edits to match q[:i] in t[:j].
+    prev := []int{};
+    curr := []int{};
+    for (i := 0; i <= m; i++) {
+        prev.append(i);
+        curr.append(i);
+    }
+    for (j := 1; j <= n; j++) {
+        curr[0] = 0;
+        for (i := 1; i <= m; i++) {
+            skipTarget := prev[i];
+            subCost := prev[i - 1] + (q[i - 1] == t[j - 1] ? 0 : 1);
+            delQuery := curr[i - 1] + 1;
+            curr[i] = minInt(skipTarget, minInt(subCost, delQuery));
+        }
+        for (i := 0; i <= m; i++) prev[i] = curr[i];
+    }
+    edits := prev[m];
+    if (edits > maxEdits) return false, 0;
+    return true, 1000 + edits * 1000 + n;
+}
+
+func optionFuzzyScore(query string, opt versionOption) (bool, int) {
+    okLabel, labelScore := fuzzyScore(query, opt.label);
+    okBoth, bothScore := fuzzyScore(query, opt.label + " " + opt.detail);
+    if (okLabel && okBoth) return true, minInt(labelScore, bothScore + 50);
+    if (okLabel) return true, labelScore;
+    if (okBoth) return true, bothScore + 50;
+    return false, 0;
+}
+
+func buildVersionOptions(releases []Release) []versionOption {
+    options := []versionOption{};
+    newest := latest(releases, false);
+    nightly := latest(releases, true);
+    if (newest >= 0) {
+        options.append(versionOption{label: "latest (stable)", detail: releases[newest].version, releaseIndex: newest, available: true});
+    } else {
+        options.append(versionOption{label: "latest (stable)", detail: "unavailable", releaseIndex: -1, available: false});
+    }
+    if (nightly >= 0) {
+        options.append(versionOption{label: "latest-nightly", detail: releases[nightly].version, releaseIndex: nightly, available: true});
+    } else {
+        options.append(versionOption{label: "latest-nightly", detail: "unavailable", releaseIndex: -1, available: false});
+    }
+    for (i, item := range releases) {
+        tag := item.nightly ? "nightly" : (item.prerelease ? "prerelease" : "stable");
+        detail := item.reason != "" ? "unavailable: " + item.reason : tag;
+        options.append(versionOption{label: item.version, detail: detail, releaseIndex: i, available: item.reason == ""});
+    }
+    return options;
+}
+
+func (model *versionModel) queryText() string {
+    out := "";
+    for (_, ch := range model.queryRunes) out += ch;
+    return out;
+}
+
+func (model *versionModel) clampSearchScroll() {
+    width := 20;
+    total := len(model.queryRunes);
+    if (total <= width) {
+        model.searchScroll = 0;
+        return;
+    }
+    if (model.searchCursor < model.searchScroll) model.searchScroll = model.searchCursor;
+    if (model.searchCursor > model.searchScroll + width) model.searchScroll = model.searchCursor - width;
+    maxScroll := total - width;
+    if (model.searchScroll > maxScroll) model.searchScroll = maxScroll;
+    if (model.searchScroll < 0) model.searchScroll = 0;
+}
+
+func (model *versionModel) applyFilter() {
+    query := trim(model.queryText());
+    indices := []int{};
+    scores := []int{};
+    if (query == "") {
+        for (i := 0; i < len(model.options); i++) indices.append(i);
+    } else {
+        for (i, opt := range model.options) {
+            matched, score := optionFuzzyScore(query, opt);
+            if (matched) {
+                indices.append(i);
+                scores.append(score);
+            }
+        }
+        // Insertion sort by (score ASC, original index ASC) for stable ranking.
+        for (i := 1; i < len(indices); i++) {
+            keyIdx := indices[i];
+            keyScore := scores[i];
+            j := i - 1;
+            for (j >= 0 && (scores[j] > keyScore || (scores[j] == keyScore && indices[j] > keyIdx))) {
+                indices[j + 1] = indices[j];
+                scores[j + 1] = scores[j];
+                j--;
+            }
+            indices[j + 1] = keyIdx;
+            scores[j + 1] = keyScore;
+        }
+    }
+    model.filtered = indices;
+    model.cursor = 0;
+    for (i := 0; i < len(model.filtered); i++) {
+        if (model.options[model.filtered[i]].available) { model.cursor = i; break; }
+    }
+    model.scroll = 0;
+    model.clampScroll();
+}
+
+func newVersionModel(releases []Release) versionModel {
+    model := versionModel{
+        options: buildVersionOptions(releases),
+        queryRunes: []string{},
+        width: 80,
+        height: 24
+    };
+    model.applyFilter();
+    return model;
+}
+
+func (model *versionModel) Init() tui.Cmd { return tui.NoCmd; }
+
+func (model *versionModel) visibleRows() int {
+    rows := model.height - 9;
+    if (rows > 10) rows = 10;
+    if (rows < 5) rows = 5;
+    return rows;
+}
+
+func (model *versionModel) clampScroll() {
+    rows := model.visibleRows();
+    if (model.cursor < model.scroll) model.scroll = model.cursor;
+    if (model.cursor >= model.scroll + rows) model.scroll = model.cursor - rows + 1;
+    maxScroll := len(model.filtered) - rows;
+    if (maxScroll < 0) maxScroll = 0;
+    if (model.scroll > maxScroll) model.scroll = maxScroll;
+    if (model.scroll < 0) model.scroll = 0;
+}
+
+func (model *versionModel) insertQueryChar(ch string) {
+    updated := []string{};
+    for (i := 0; i < model.searchCursor; i++) updated.append(model.queryRunes[i]);
+    updated.append(ch);
+    for (i := model.searchCursor; i < len(model.queryRunes); i++) updated.append(model.queryRunes[i]);
+    model.queryRunes = updated;
+    model.searchCursor++;
+    model.clampSearchScroll();
+    model.err = "";
+    model.applyFilter();
+}
+
+func (model *versionModel) deleteBeforeCursor() {
+    if (model.searchCursor <= 0) return;
+    updated := []string{};
+    for (i := 0; i < model.searchCursor - 1; i++) updated.append(model.queryRunes[i]);
+    for (i := model.searchCursor; i < len(model.queryRunes); i++) updated.append(model.queryRunes[i]);
+    model.queryRunes = updated;
+    model.searchCursor--;
+    model.clampSearchScroll();
+    model.err = "";
+    model.applyFilter();
+}
+
+func (model *versionModel) deleteAtCursor() {
+    if (model.searchCursor >= len(model.queryRunes)) return;
+    updated := []string{};
+    for (i := 0; i < model.searchCursor; i++) updated.append(model.queryRunes[i]);
+    for (i := model.searchCursor + 1; i < len(model.queryRunes); i++) updated.append(model.queryRunes[i]);
+    model.queryRunes = updated;
+    model.clampSearchScroll();
+    model.err = "";
+    model.applyFilter();
+}
+
+func (model *versionModel) Update(message tui.Msg) (tui.Model, tui.Cmd) {
+    switch (event := message.(type)) {
+        case tui.WindowSizeMsg:
+            model.width = event.Width;
+            model.height = event.Height;
+            model.clampScroll();
+        case tui.EOFMsg:
+            model.cancelled = true;
+            return model, tui.Quit;
+        case tui.MouseMsg:
+            if (event.Action == "scroll") {
+                if (event.Button == "up" && model.cursor > 0) { model.cursor--; model.err = ""; model.clampScroll(); }
+                if (event.Button == "down" && model.cursor + 1 < len(model.filtered)) { model.cursor++; model.err = ""; model.clampScroll(); }
+            }
+        case tui.KeyMsg:
+            if (event.Key == "ctrl+c" || event.Key == "esc") {
+                model.cancelled = true;
+                return model, tui.Quit;
+            }
+            if (event.Key == "up" && model.cursor > 0) {
+                model.cursor--; model.err = ""; model.clampScroll();
+            } else if (event.Key == "down" && model.cursor + 1 < len(model.filtered)) {
+                model.cursor++; model.err = ""; model.clampScroll();
+            } else if (event.Key == "pgup" && len(model.filtered) > 0) {
+                model.cursor -= model.visibleRows();
+                if (model.cursor < 0) model.cursor = 0;
+                model.err = ""; model.clampScroll();
+            } else if (event.Key == "pgdown" && len(model.filtered) > 0) {
+                model.cursor += model.visibleRows();
+                if (model.cursor >= len(model.filtered)) model.cursor = len(model.filtered) - 1;
+                model.err = ""; model.clampScroll();
+            } else if (event.Key == "left") {
+                if (model.searchCursor > 0) { model.searchCursor--; model.clampSearchScroll(); }
+            } else if (event.Key == "right") {
+                if (model.searchCursor < len(model.queryRunes)) { model.searchCursor++; model.clampSearchScroll(); }
+            } else if (event.Key == "home" || event.Key == "ctrl+a") {
+                model.searchCursor = 0; model.clampSearchScroll();
+            } else if (event.Key == "end" || event.Key == "ctrl+e") {
+                model.searchCursor = len(model.queryRunes); model.clampSearchScroll();
+            } else if (event.Key == "backspace") {
+                model.deleteBeforeCursor();
+            } else if (event.Key == "delete") {
+                model.deleteAtCursor();
+            } else if (event.Key == "ctrl+u") {
+                model.queryRunes = []string{};
+                model.searchCursor = 0;
+                model.searchScroll = 0;
+                model.err = "";
+                model.applyFilter();
+            } else if (event.Key == "space") {
+                model.insertQueryChar(" ");
+            } else if (event.Key == "rune" && !event.Alt) {
+                model.insertQueryChar(event.Text);
+            } else if (event.Key == "enter") {
+                if (len(model.filtered) == 0) {
+                    model.err = "No matching versions. Edit or clear the search query.";
+                } else {
+                    opt := model.options[model.filtered[model.cursor]];
+                    if (opt.available) {
+                        model.confirmed = true;
+                        return model, tui.Quit;
+                    }
+                    model.err = "That release is unavailable for this target. Choose an available version.";
+                }
+            }
+    }
+    return model, tui.NoCmd;
+}
+
+func (model *versionModel) renderSearchBar() string {
+    width := 20;
+    total := len(model.queryRunes);
+    start := model.searchScroll;
+    end := start + width;
+    if (end > total) end = total;
+    leftMark := start > 0 ? "\x1b[2m‹\x1b[0m" : " ";
+    rightMark := end < total ? "\x1b[2m›\x1b[0m" : " ";
+    body := "";
+    for (i := start; i < end; i++) {
+        if (i == model.searchCursor) body += "\x1b[7m" + model.queryRunes[i] + "\x1b[0m";
+        else body += model.queryRunes[i];
+    }
+    if (model.searchCursor == end) {
+        body += "\x1b[7m \x1b[0m";
+    }
+    used := (end - start) + (model.searchCursor == end ? 1 : 0);
+    for (pad := used; pad < width + 1; pad++) body += " ";
+    status := "\x1b[2m(" + io.Sprint(len(model.filtered)) + "/" + io.Sprint(len(model.options)) + ")\x1b[0m";
+    return "  \x1b[1;36mSearch:\x1b[0m [" + leftMark + body + rightMark + "] " + status + "\n";
+}
+
+func (model *versionModel) View() string {
+    out := model.renderSearchBar();
+    if (len(model.filtered) == 0) {
+        out += "\x1b[2m    No matching versions.\x1b[0m\n";
+    } else {
+        rows := model.visibleRows();
+        end := model.scroll + rows;
+        if (end > len(model.filtered)) end = len(model.filtered);
+        if (model.scroll > 0) out += "\x1b[2m    ▲ " + io.Sprint(model.scroll) + " more above\x1b[0m\n";
+        for (i := model.scroll; i < end; i++) {
+            optIdx := model.filtered[i];
+            opt := model.options[optIdx];
+            out += renderOptionRow(i == model.cursor, i + 1, opt.label, opt.detail, !opt.available);
+        }
+        if (end < len(model.filtered)) out += "\x1b[2m    ▼ " + io.Sprint(len(model.filtered) - end) + " more below\x1b[0m\n";
+    }
+    if (model.err != "") out += "\x1b[31m  " + model.err + "\x1b[0m\n";
+    out += "\x1b[2m  Type to filter · ←/→ Edit · ↑/↓ Navigate · Enter Install · Esc/Ctrl+C Cancel\x1b[0m";
+    return out;
+}
+
+func runVersionTUI(releases []Release) Release {
+    available := false;
+    for (_, item := range releases) { if (item.reason == "") available = true; }
+    require(available, "no matching compiler/stdlib release is available for this target");
+    printSection(3, 3, "Select Ocean Version");
+    model := newVersionModel(releases);
+    program := tui.NewProgram(&model, tui.Options{AltScreen: false, Mouse: true});
+    program.Run().unwrap();
+    require(model.confirmed && !model.cancelled, "installation cancelled");
+    return releases[model.options[model.filtered[model.cursor]].releaseIndex];
+}

@@ -1,0 +1,193 @@
+package main;
+import "testing";
+import "term/tui";
+
+func TestVersionMetadata(t *testing.T) {
+    release: Release; release.version = "1.2.3"; release.commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    data := compilerInfo("   __    __    _____ _____ _____ _____ _  _ \n__/  \\__/     |  _  |  ___|  ___|  _  | \\| |\n\nOcean compiler (ocean) 1.2.3\nCommit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (2026-11-13), built 2026-11-14T01:02:03Z\nCopyright Connor Egan 2026\n",release);
+    if (text(data["build_date"]) != "2026-11-14T01:02:03Z" || text(data["commit_date"]) != "2026-11-13") t.Fatal("metadata mismatch");
+    plain := compilerInfo("Ocean compiler (ocean) 1.2.3\nCommit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (2026-11-13), built 2026-11-14T01:02:03Z\nCopyright Connor Egan 2026\n",release);
+    if (text(plain["build_date"]) != "2026-11-14T01:02:03Z" || text(plain["commit_date"]) != "2026-11-13") t.Fatal("plain metadata mismatch");
+}
+func TestProfileBlock(t *testing.T) {
+    block := entry("unused","# >>> Ocean installer >>>\nexport PATH='/a b':\"$PATH\"\n# <<< Ocean installer <<<\n",false);
+    first := editProfile("# user settings\n",block);
+    if (editProfile(first,block) != first || !starts(first,"# user settings")) t.Fatal("profile edit is not idempotent");
+    if (psQuote("a'b") != "'a''b'" || shQuote("a'b") != "'a'\"'\"'b'") t.Fatal("path quoting");
+}
+func TestLatestSelection(t *testing.T) {
+    beta: Release; beta.version="2.0.0-beta";beta.prerelease=true;beta.nightly=true;
+    stable: Release;stable.version="1.0.0";stable.stable=true;
+    unavailable: Release;unavailable.reason="missing artifact";unavailable.stable=true;unavailable.nightly=true;
+    releases := []Release{beta,unavailable,stable};
+    if (latest(releases,false) != 2 || latest(releases,true) != 0) t.Fatal("channel selection");
+    if (latest([]Release{beta},false) != -1 || latest([]Release{stable},true) != -1) t.Fatal("channel fallback");
+    beta.stable=true;
+    if (latest([]Release{beta},false) != -1 || latest([]Release{unavailable},true) != -1) t.Fatal("unavailable/prerelease stable selection");
+}
+func TestRedirectsAndDependencyPlans(t *testing.T) {
+    if (redirectURL("https://example.com/a/b","/asset") != "https://example.com/asset") t.Fatal("root redirect");
+    if (redirectURL("https://example.com/a/b","asset") != "https://example.com/a/asset") t.Fatal("relative redirect");
+    if (allowedURL("http://example.com/asset") || !allowedURL("https://example.com/asset")) t.Fatal("download TLS policy");
+    if (systemDependencyCommand("apt-get")[0] != "apt-get" || systemDependencyCommand("brew")[2] != "llvm" || len(systemDependencyCommand("not-a-manager")) != 0) t.Fatal("dependency package manager plans");
+}
+func repeated(character i8, count int) string { out := []i8{};for (i:=0;i<count;i++) out.append(character);return out->string; }
+func octalField(value int, width int) string {
+    text := "";
+    for (;;) { digit := value % 8; text = ioDigit(digit) + text; value /= 8; if (value == 0) break; }
+    for (len(text) < width-1) text = "0"+text;
+    return text+"\0";
+}
+func ioDigit(digit int) string { digits := "01234567"; return digits[digit:digit+1]; }
+func tarFixture(name string, body string, kind i8) string {
+    header: [512]i8;
+    for (i:=0;i<len(name);i++) header[i]=name[i];
+    size:=octalField(len(body),12);for(i:=0;i<12;i++)header[124+i]=size[i];
+    for(i:=148;i<156;i++)header[i]=' ';
+    header[156]=kind;sum:=0;for(_,c:=range header)sum+=(c->u8)->int;
+    check:=octalField(sum,8);for(i:=0;i<8;i++)header[148+i]=check[i];
+    bytes:=[]i8{};bytes.append(header...);
+    return (bytes->string)+body+repeated(0->i8,(512-len(body)%512)%512)+repeated(0->i8,1024);
+}
+func archiveRejected(bytes string, path string) (rejected bool) {
+    defer func(){ value:=recover();if(value!=null)rejected=true; }();
+    unpack(bytes,path,"ocean");return;
+}
+func TestArchiveValidation(t *testing.T) {
+    platform,architecture=target();
+    work:=temporary();defer removeTree(work);path:=pathJoin(work,"compiler");
+    unpack(tarFixture("ocean","native bytes",'0'),path,"ocean");
+    if(readFile(path)!="native bytes")t.Fatal("tar payload");
+    if(!archiveRejected(tarFixture("../escape","bad",'0'),path))t.Fatal("traversal accepted");
+    if(!archiveRejected(tarFixture("ocean","target",'2'),path))t.Fatal("symlink accepted");
+    if(!archiveRejected("truncated",path))t.Fatal("truncation accepted");
+}
+
+func TestOptionalPlanFields(t *testing.T) {
+    plan := make(map[string]any);
+    if (optionalText(plan,"owner") != "" || optionalText(plan,"extraBin") != "") t.Fatal("missing optional plan field");
+    plan["owner"] = "1000:1000"; plan["extraBin"] = "C:/Ocean/bin";
+    if (optionalText(plan,"owner") != "1000:1000" || optionalText(plan,"extraBin") != "C:/Ocean/bin") t.Fatal("optional plan field lost");
+}
+
+func TestNightlyTagNames(t *testing.T) {
+    if (!nightlyTag("nightly-2026.11.15") || !nightlyTag("nightly")) t.Fatal("nightly tag rejected");
+    for (_,tag:=range []string{"2.0.0-beta","nightly-2026.1.15","nightly-2026.13.15","nightly-2026.11.00","nightly-202x.11.15"}) {
+        if (nightlyTag(tag)) t.Fatal("invalid nightly tag accepted");
+    }
+}
+
+func TestTUIEditTextInput(t *testing.T) {
+    s := "";
+    s = editTextInput(s, tui.KeyMsg{Key: "rune", Text: "/"});
+    s = editTextInput(s, tui.KeyMsg{Key: "rune", Text: "o"});
+    s = editTextInput(s, tui.KeyMsg{Key: "rune", Text: "p"});
+    s = editTextInput(s, tui.KeyMsg{Key: "space", Text: " "});
+    s = editTextInput(s, tui.KeyMsg{Key: "rune", Text: "é"});
+    if (s != "/op é") t.Fatal("text input mismatch: " + s);
+    s = editTextInput(s, tui.KeyMsg{Key: "backspace"});
+    if (s != "/op ") t.Fatal("utf8 backspace mismatch: " + s);
+    s = editTextInput(s, tui.KeyMsg{Key: "ctrl+u"});
+    if (s != "") t.Fatal("ctrl+u did not clear");
+}
+
+func realTempDir() string {
+    work := temporary();
+    if (platform != "windows") {
+        resolved := command("sh", "-c", "cd " + shQuote(work) + " && pwd -P");
+        if (resolved != "") return resolved;
+    }
+    return work;
+}
+
+func TestTUISelectModel(t *testing.T) {
+    model := selectModel{
+        prompt: "Choose scope:",
+        options: []selectOption{
+            selectOption{label: "System-wide", detail: "/usr/local/lib/ocean"},
+            selectOption{label: "Current user", detail: "/home/user/.local/lib/ocean"},
+            selectOption{label: "Custom directory", detail: "specify path"}
+        },
+        cursor: 0
+    };
+    if (index(model.View(), "Choose scope:") < 0) t.Fatal("select view missing prompt");
+    model.Update(tui.KeyMsg{Key: "down"});
+    if (model.cursor != 1) t.Fatal("select cursor did not move down");
+    _, cmd := model.Update(tui.KeyMsg{Key: "enter"});
+    if (!model.confirmed || model.cancelled || model.cursor != 1 || cmd == tui.NoCmd) t.Fatal("enter did not confirm selection");
+    hotkey := selectModel{prompt: "Choose:", options: model.options, cursor: 0};
+    _, cmd = hotkey.Update(tui.KeyMsg{Key: "rune", Text: "3"});
+    if (!hotkey.confirmed || hotkey.cursor != 2 || cmd == tui.NoCmd) t.Fatal("numeric hotkey did not select option");
+}
+
+func TestTUIInputModelValidation(t *testing.T) {
+    platform, architecture = target();
+    work := realTempDir(); defer removeTree(work);
+    dest := pathJoin(work, "ocean");
+    pathPrompt := inputModel{prompt: "Directory:", mode: "path", value: "relative/path"};
+    pathPrompt.Update(tui.KeyMsg{Key: "enter"});
+    if (pathPrompt.confirmed || pathPrompt.err == "") t.Fatal("invalid relative path was accepted");
+    pathPrompt.value = dest;
+    _, cmd := pathPrompt.Update(tui.KeyMsg{Key: "enter"});
+    if (!pathPrompt.confirmed || pathPrompt.normalized != dest || cmd == tui.NoCmd) t.Fatal("valid custom path was not accepted");
+    replacePrompt := inputModel{prompt: "Confirm:", mode: "exact", expected: "remove " + dest, value: "wrong"};
+    replacePrompt.Update(tui.KeyMsg{Key: "enter"});
+    if (replacePrompt.confirmed || replacePrompt.err == "") t.Fatal("wrong replace confirmation was accepted");
+    replacePrompt.value = "remove " + dest;
+    _, cmd = replacePrompt.Update(tui.KeyMsg{Key: "enter"});
+    if (!replacePrompt.confirmed || cmd == tui.NoCmd) t.Fatal("exact replace confirmation did not confirm");
+    cancelPrompt := inputModel{prompt: "Confirm:", mode: "exact", expected: "remove " + dest};
+    _, cmd = cancelPrompt.Update(tui.KeyMsg{Key: "ctrl+c"});
+    if (!cancelPrompt.cancelled || cmd == tui.NoCmd) t.Fatal("ctrl+c did not cancel input");
+}
+
+func TestTUIVersionModelSelection(t *testing.T) {
+    platform, architecture = target();
+    unavailable: Release; unavailable.version = "0.5.0"; unavailable.stable = true; unavailable.reason = "no binary";
+    stable: Release; stable.version = "1.0.0"; stable.stable = true;
+    nightly: Release; nightly.version = "nightly-2026.11.26"; nightly.nightly = true; nightly.prerelease = true;
+    releases := []Release{nightly, stable, unavailable};
+    model := newVersionModel(releases);
+    if (model.cursor != 0 || !model.options[model.filtered[0]].available || model.options[model.filtered[0]].releaseIndex != 1) t.Fatal("initial version cursor should be latest stable");
+    // Navigate down to unavailable release and ensure Enter refuses it.
+    for (i := 0; i < len(model.filtered) - 1; i++) model.Update(tui.KeyMsg{Key: "down"});
+    if (model.cursor != len(model.filtered) - 1) t.Fatal("down key did not reach last option");
+    model.Update(tui.KeyMsg{Key: "enter"});
+    if (model.confirmed || model.err == "") t.Fatal("unavailable release was selected");
+    // Type fuzzy query "2026.25" which should match nightly-2026.11.26 (and latest-nightly) and exclude 1.0.0 / 0.5.0.
+    for (_, ch := range []string{"2","0","2","6",".","2","5"}) model.Update(tui.KeyMsg{Key: "rune", Text: ch});
+    if (len(model.filtered) == 0) t.Fatal("fuzzy query 2026.25 did not match nightly-2026.11.26");
+    for (_, idx := range model.filtered) {
+        if (model.options[idx].label == "1.0.0" || model.options[idx].label == "0.5.0") t.Fatal("unrelated version matched 2026.25");
+    }
+    // Navigate left/right in search bar and insert/backspace.
+    model.Update(tui.KeyMsg{Key: "left"});
+    model.Update(tui.KeyMsg{Key: "rune", Text: "1"});
+    if (model.queryText() != "2026.215") t.Fatal("left+insert mismatch: " + model.queryText());
+    model.Update(tui.KeyMsg{Key: "backspace"});
+    if (model.queryText() != "2026.25") t.Fatal("mid-string backspace mismatch: " + model.queryText());
+    model.Update(tui.KeyMsg{Key: "right"});
+    _, cmd := model.Update(tui.KeyMsg{Key: "enter"});
+    if (!model.confirmed || model.options[model.filtered[model.cursor]].releaseIndex != 0 || cmd == tui.NoCmd) t.Fatal("filtered nightly selection failed");
+}
+
+func TestTUIVersionSearchScroll(t *testing.T) {
+    stable: Release; stable.version = "1.0.0"; stable.stable = true;
+    model := newVersionModel([]Release{stable});
+    for (i := 0; i < 20; i++) model.Update(tui.KeyMsg{Key: "rune", Text: "a"});
+    if (model.searchScroll != 0) t.Fatal("search bar should not scroll at 20 chars");
+    model.Update(tui.KeyMsg{Key: "rune", Text: "b"});
+    if (model.searchScroll != 1 || model.searchCursor != 21) t.Fatal("search bar should start scrolling at 21 chars");
+    for (i := 0; i < 21; i++) model.Update(tui.KeyMsg{Key: "left"});
+    if (model.searchCursor != 0 || model.searchScroll != 0) t.Fatal("moving left to start did not scroll back to 0");
+    if (index(model.View(), "Search:") < 0) t.Fatal("version view missing search bar");
+}
+
+func TestTUIConfirmModel(t *testing.T) {
+    model := confirmModel{title: "Proceed?", detail: "Details", selected: false};
+    if (index(model.View(), "Proceed?") < 0) t.Fatal("confirm view missing title");
+    model.Update(tui.KeyMsg{Key: "right"});
+    if (!model.selected) t.Fatal("right arrow did not toggle confirm");
+    _, cmd := model.Update(tui.KeyMsg{Key: "enter"});
+    if (!model.decided || !model.selected || cmd == tui.NoCmd) t.Fatal("enter did not confirm");
+}
