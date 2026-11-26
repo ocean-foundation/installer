@@ -43,15 +43,15 @@ requires explicit consent. Package-manager changes cannot be rolled back.
 PATH configuration supports Bash, Zsh, Fish, csh and POSIX shells on Unix, and
 the Windows user or machine environment. Open a new shell after installation.
 
-Linux release builds use static libcurl with c-ares DNS to avoid loading host
-glibc NSS modules into the static executable. The HTTP dependency build requires
-`libc-ares-dev` and accepts either `libcares.a` or Ubuntu 24.04's
-`libcares_static.a`. It stages a private `libcares.a` link name for pkg-config
-and verifies that curl actually selected c-ares.
-
-Release archives contain only `ocean-installer` (`ocean-installer.exe` on Windows).
-Dependency bundles are separate `ocean-deps_<tag>_<arch>-<os>.tar.xz` assets.
-All seven native platforms are supported; Wasm is excluded.
+Pushing an installer version tag such as `v0.1.0` runs the release workflow.
+One macOS runner downloads the latest stable Ocean compiler and matching stdlib,
+installs the target toolchains, and cross-builds all seven native installers.
+The GitHub release contains a tar archive per target. Linux installers are
+statically linked and use the system CA store and c-ares for DNS. Windows
+installers statically link libcurl and libffi and use Windows Schannel for TLS.
+The Windows archives contain the executable and third-party license notices.
+macOS installers use the libraries provided by macOS. The compiler's dependency
+bundles are separate `ocean-deps_<tag>_<arch>-<os>.tar.xz` assets.
 
 Validation:
 

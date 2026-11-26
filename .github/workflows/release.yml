@@ -1,0 +1,132 @@
+name: Installer release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event.deleted == false
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    env:
+      OCEAN_REPO: ocean-foundation/ocean
+      OCEAN_TARGET_DIR: ${{ runner.temp }}/ocean-targets
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the latest stable compiler
+        id: ocean
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api "repos/$OCEAN_REPO/releases/latest" --jq .tag_name)
+          archive="ocean_${tag}_aarch64-macos.tar"
+          checksums=SHA256SUMS_aarch64-macos.txt
+          prefix="$RUNNER_TEMP/ocean"
+          mkdir -p "$prefix/bin"
+          cd "$prefix"
+          gh release download "$tag" --repo "$OCEAN_REPO" \
+            --pattern "$archive" --pattern "$checksums"
+          awk -v archive="$archive" '$2 == archive { print; found++ } END { exit (found != 1) }' \
+            "$checksums" > compiler.sha256
+          shasum -a 256 -c compiler.sha256
+          tar -xf "$archive" -C bin ocean
+          bin/ocean --version
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download the matching standard library
+        uses: actions/checkout@v4
+        with:
+          repository: ocean-foundation/ocean-src
+          ref: refs/tags/${{ steps.ocean.outputs.tag }}
+          path: .ocean-stdlib
+          persist-credentials: false
+
+      - name: Install target toolchains and cross-build the installers
+        shell: bash
+        env:
+          OCEAN_SRC: ${{ github.workspace }}/.ocean-stdlib
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          targets=(
+            x86_64-linux aarch64-linux riscv64-linux
+            x86_64-macos aarch64-macos
+            x86_64-windows aarch64-windows
+          )
+          ocean target "${targets[@]}"
+
+          mkdir -p dist
+          for target in "${targets[@]}"; do
+            os=${target#*-}
+            staging="$RUNNER_TEMP/installer/$target"
+            mkdir -p "$staging"
+            binary=ocean-installer
+            build_flags=()
+            if [[ "$os" == windows ]]; then
+              binary+=.exe
+            fi
+            if [[ "$os" != macos ]]; then
+              deps="$RUNNER_TEMP/static-deps/$target"
+              bash .github/scripts/build-static-deps.sh "$target" "$deps" "$staging/licenses"
+              export PKG_CONFIG_LIBDIR="$deps/prefix/lib/pkgconfig"
+              build_flags+=(--static)
+            else
+              export PKG_CONFIG_LIBDIR=
+            fi
+            export PKG_CONFIG_PATH=
+            OCOS="$os" OCARCH="${target%-*}" ocean build "${build_flags[@]}" . -o "$staging/$binary"
+            test -s "$staging/$binary"
+
+            case "$os" in
+              linux)
+                file -b "$staging/$binary" | grep -E 'statically linked|static-pie linked'
+                ;;
+              macos)
+                imports=$(otool -L "$staging/$binary")
+                awk 'NR > 1 && $1 !~ /^\/(usr\/lib|System\/Library)\// { print; failed=1 }
+                  END { exit failed }' <<< "$imports"
+                ;;
+              windows)
+                imports=$(xcrun objdump -p "$staging/$binary")
+                grep -q 'DLL Name:' <<< "$imports"
+                while read -r dll; do
+                  case "$dll" in
+                    api-ms-win-*|advapi32.dll|bcrypt.dll|crypt32.dll|iphlpapi.dll|\
+                    kernel32.dll|kernelbase.dll|msvcrt.dll|ncrypt.dll|normaliz.dll|\
+                    ntdll.dll|ole32.dll|secur32.dll|shell32.dll|ucrtbase.dll|\
+                    user32.dll|version.dll|winmm.dll|ws2_32.dll)
+                      ;;
+                    *)
+                      echo "Unexpected Windows DLL import in $target: $dll" >&2
+                      exit 1
+                      ;;
+                  esac
+                done < <(awk '/DLL Name:/ { print tolower($NF) }' <<< "$imports")
+                ;;
+            esac
+
+            COPYFILE_DISABLE=1 tar -cf "dist/ocean-installer_${RELEASE_TAG}_${target}.tar" -C "$staging" .
+          done
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          COMPILER_TAG: ${{ steps.ocean.outputs.tag }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/*.tar --verify-tag \
+            --title "$RELEASE_TAG" --notes "Built with Ocean $COMPILER_TAG."
