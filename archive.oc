@@ -66,8 +66,10 @@ func compilerInfo(output string, release Release) map[string]any {
     result["commit_date"] = date; result["build_date"] = built; return result;
 }
 func prepare(work string, release Release) string {
-    io.Println("Downloading compiler and matching tagged standard library...");
-    archive := pathJoin(work, "compiler.tar"); body := get(release.url, 512 * 1024 * 1024); writeFile(archive, body); verifyDigest(archive, release.digest);
+    archive := pathJoin(work, "compiler.tar");
+    downloadFile(release.url, archive, 512 * 1024 * 1024, "Downloading compiler");
+    verifyDigest(archive, release.digest);
+    body := readFile(archive);
     payload := pathJoin(work, "payload"); mkdir(pathJoin(payload, "bin"));
     suffix := platform == "windows" ? ".exe" : "";
     binary := pathJoin(payload, "bin/ocean" + suffix);
@@ -76,6 +78,7 @@ func prepare(work string, release Release) string {
     info := compilerInfo(command(binary, "--version"), release);
     expectedDate := command("git", "-C", pathJoin(work, "compiler.git"), "show", "-s", "--format=%cs", release.commit);
     require(text(info["commit_date"]) == expectedDate, "compiler commit date does not match Git tag");
+    io.Println("Fetching matching tagged standard library...");
     source := pathJoin(payload, "src"); command("git", "init", source);
     command("git", "-C", source, "fetch", "--depth=1", "--no-tags", "https://github.com/ocean-foundation/ocean-src.git", "refs/tags/" + release.version);
     commit := command("git", "-C", source, "rev-parse", "FETCH_HEAD^{commit}"); require(commit == release.sourceCommit, "stdlib tag changed during installation");

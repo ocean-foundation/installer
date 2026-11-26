@@ -104,8 +104,9 @@ func extendPathPlan(plan map[string]any, extra string) map[string]any {
 }
 func localDependencies(work string, payload string, release Release, destination string) {
     require(release.dependenciesURL != "","this release has no user-local dependency bundle for the target");
-    io.Println("Downloading matching user-local Clang and library bundle...");
-    file := pathJoin(work,"dependencies.tar.xz"); writeFile(file,get(release.dependenciesURL,512*1024*1024)); verifyDigest(file,release.dependenciesDigest);
+    file := pathJoin(work,"dependencies.tar.xz");
+    downloadFile(release.dependenciesURL, file, 512 * 1024 * 1024, "Downloading dependencies");
+    verifyDigest(file,release.dependenciesDigest);
     listing := command("tar","-tf",file);
     for (_, path := range split(listing,"\n")) {
         require(!starts(path,"/") && index(path,"\\") < 0 && index(path,":") < 0,"unsafe dependency bundle path");

@@ -1,6 +1,8 @@
 package main;
+import "os";
 import "testing";
 import "term/tui";
+import "time";
 
 func TestVersionMetadata(t *testing.T) {
     release: Release; release.version = "1.2.3"; release.commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -139,6 +141,21 @@ func TestTUIInputModelValidation(t *testing.T) {
     cancelPrompt := inputModel{prompt: "Confirm:", mode: "exact", expected: "remove " + dest};
     _, cmd = cancelPrompt.Update(tui.KeyMsg{Key: "ctrl+c"});
     if (!cancelPrompt.cancelled || cmd == tui.NoCmd) t.Fatal("ctrl+c did not cancel input");
+    // Deleting text in inline mode must pad the input line to width - 1 so old cursor cells are overwritten.
+    padded := inputModel{prompt: "Directory:", mode: "path", width: 30};
+    padded.Update(tui.WindowSizeMsg{Width: 40, Height: 24});
+    padded.Update(tui.KeyMsg{Key: "rune", Text: "a"});
+    padded.Update(tui.KeyMsg{Key: "rune", Text: "b"});
+    padded.Update(tui.KeyMsg{Key: "backspace"});
+    view := padded.View();
+    firstNL := index(view, "\n");
+    secondNL := firstNL >= 0 ? index(view[firstNL + 1:], "\n") : -1;
+    if (firstNL < 0 || secondNL < 0) t.Fatal("input view missing expected lines");
+    inputLine := view[firstNL + 1 : firstNL + 1 + secondNL];
+    cursorEnd := index(inputLine, "\x1b[7m \x1b[0m");
+    if (cursorEnd < 0) t.Fatal("input view missing cursor");
+    trailing := inputLine[cursorEnd + len("\x1b[7m \x1b[0m"):];
+    if (index(trailing, "   ") < 0) t.Fatal("input line not padded with spaces after cursor to clear deleted text");
 }
 
 func TestTUIVersionModelSelection(t *testing.T) {
@@ -190,4 +207,65 @@ func TestTUIConfirmModel(t *testing.T) {
     if (!model.selected) t.Fatal("right arrow did not toggle confirm");
     _, cmd := model.Update(tui.KeyMsg{Key: "enter"});
     if (!model.decided || !model.selected || cmd == tui.NoCmd) t.Fatal("enter did not confirm");
+}
+
+func TestFormatBytesAndDuration(t *testing.T) {
+    if (formatBytes(0) != "0 B" || formatBytes(512) != "512 B") t.Fatal("bytes formatting");
+    if (formatBytes(1024) != "1.0 KB" || formatBytes(1536) != "1.5 KB") t.Fatal("kilobytes formatting");
+    if (formatBytes(10 * 1024 * 1024) != "10.0 MB") t.Fatal("megabytes formatting");
+    if (formatBytes(1073741824) != "1.00 GB" || formatBytes(1342177280) != "1.25 GB") t.Fatal("gigabytes formatting");
+    if (formatDuration(0) != "0s" || formatDuration(45) != "45s") t.Fatal("seconds formatting");
+    if (formatDuration(65) != "1m05s" || formatDuration(3720) != "1h02m") t.Fatal("minutes/hours formatting");
+}
+
+func TestRenderProgressBar(t *testing.T) {
+    mid := renderProgressBar("Downloading compiler", 5 * 1024 * 1024, 10 * 1024 * 1024, 2 * time.Second, 100, 1, false, false);
+    if (index(mid, "Downloading compiler") < 0 || index(mid, "50%") < 0 || index(mid, "5.0 MB / 10.0 MB") < 0 || index(mid, "2.5 MB/s") < 0 || index(mid, "ETA 2s") < 0) {
+        t.Fatal("determinate progress bar mismatch: " + mid);
+    }
+    if (index(mid, "█") < 0 || index(mid, "░") < 0) t.Fatal("progress bar missing fill/empty blocks");
+
+    done := renderProgressBar("Downloading compiler", 10 * 1024 * 1024, 10 * 1024 * 1024, 2 * time.Second, 100, 2, true, false);
+    if (index(done, "100%") < 0 || index(done, "10.0 MB") < 0 || index(done, "done") < 0 || index(done, "░") >= 0) {
+        t.Fatal("completed progress bar mismatch: " + done);
+    }
+
+    zeroTotal := renderProgressBar("Downloading compiler", 0, 0, 0, 80, 1, true, false);
+    if (index(zeroTotal, "100%") < 0 || index(zeroTotal, "0 B") < 0) t.Fatal("zero-byte progress bar mismatch: " + zeroTotal);
+
+    indet := renderProgressBar("Downloading compiler", 2 * 1024 * 1024, -1, time.Second, 90, 3, false, false);
+    if (index(indet, "%") >= 0 || index(indet, "2.0 MB") < 0 || index(indet, "2.0 MB/s") < 0) {
+        t.Fatal("indeterminate progress bar mismatch: " + indet);
+    }
+
+    narrow := renderProgressBar("Downloading dependencies", 5 * 1024 * 1024, 10 * 1024 * 1024, time.Second, 60, 1, false, false);
+    if (index(narrow, "50%") < 0 || index(narrow, "ETA") >= 0) t.Fatal("narrow progress bar did not drop ETA to avoid wrapping: " + narrow);
+}
+
+func TestParseResponseHead(t *testing.T) {
+    ok := parseResponseHead("HTTP/1.1 200 OK\r\nContent-Length: 12345\r\nContent-Type: application/octet-stream");
+    if (ok.statusCode != 200 || ok.contentLength != 12345 || ok.chunked) t.Fatal("200 Content-Length parse failed");
+    redir := parseResponseHead("HTTP/1.1 302 Found\r\nlocation: /compiler.tar\r\nContent-Length: 0");
+    if (redir.statusCode != 302 || redir.location != "/compiler.tar" || redir.contentLength != 0) t.Fatal("302 redirect parse failed");
+    chunked := parseResponseHead("HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked");
+    if (chunked.statusCode != 200 || !chunked.chunked || chunked.contentLength != -1) t.Fatal("chunked header parse failed");
+}
+
+func TestChunkDecoder(t *testing.T) {
+    platform, architecture = target();
+    work := temporary(); defer removeTree(work);
+    dest := pathJoin(work, "chunked.bin");
+    out := os.Open(dest, os.FileMode.BinaryWrite).unwrap();
+    progress := progressTracker{label: "test", total: -1, tty: false};
+    decoder := chunkDecoder{limit: 1024};
+    payload := "5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: ok\r\n\r\n";
+    for (i := 0; i < len(payload); i += 3) {
+        end := i + 3;
+        if (end > len(payload)) end = len(payload);
+        decoder.feed(payload[i:end], out, &progress);
+    }
+    out.Close();
+    if (decoder.state != 4 || progress.downloaded != 11 || readFile(dest) != "hello world") {
+        t.Fatal("chunk decoder output mismatch");
+    }
 }

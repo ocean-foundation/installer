@@ -68,8 +68,9 @@ with tempfile.TemporaryDirectory(prefix='ocean-native-installer-test-') as direc
     subprocess.run(['clang',str(clangSource),'-o',str(clang)],check=True)
     bundle=io.BytesIO()
     with tarfile.open(fileobj=bundle,mode='w:xz') as tar:tar.add(clang,arcname='bin/clang')
-    state={'body':archive(),'deps':bundle.getvalue(),'fail':False,'redirects':0}
+    state={'body':archive(),'deps':bundle.getvalue(),'fail':False,'redirects':0,'chunked_deps':False}
     class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version='HTTP/1.1'
         def log_message(self,*args):pass
         def do_GET(self):
             if self.path.startswith('/api/repos/ocean-foundation/ocean/releases?'):
@@ -78,13 +79,19 @@ with tempfile.TemporaryDirectory(prefix='ocean-native-installer-test-') as direc
                     releases.append(dict(tag_name=tag,prerelease=pre,draft=False,assets=[dict(name=f'ocean_{tag}_{target}.tar',browser_download_url=f'http://127.0.0.1:{self.server.server_port}/redirect',digest='sha256:'+hashlib.sha256(state['body']).hexdigest()),dict(name=f'ocean-deps_{tag}_{target}.tar.xz',browser_download_url=f'http://127.0.0.1:{self.server.server_port}/deps.tar.xz',digest='sha256:'+hashlib.sha256(state['deps']).hexdigest())]))
                 data=json.dumps(releases).encode();self.send_response(200)
             elif self.path=='/redirect':
-                state['redirects']+=1;self.send_response(302);self.send_header('Location','/compiler.tar');self.send_header('Content-Length','0');self.end_headers();return
+                state['redirects']+=1;self.send_response(302);self.send_header('Location','/compiler.tar');self.send_header('Content-Length','0');self.send_header('Connection','close');self.end_headers();return
             elif self.path=='/deps.tar.xz':
                 data=state['deps'];self.send_response(200)
+                if state['chunked_deps']:
+                    self.send_header('Transfer-Encoding','chunked');self.send_header('Connection','close');self.end_headers()
+                    for i in range(0,len(data),4096):
+                        part=data[i:i+4096]
+                        self.wfile.write(f'{len(part):x}\r\n'.encode()+part+b'\r\n')
+                    self.wfile.write(b'0\r\n\r\n');return
             elif self.path=='/compiler.tar':
                 data=state['body'];self.send_response(503 if state['fail'] else 200)
             else:data=b'not found';self.send_response(404)
-            self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+            self.send_header('Content-Length',str(len(data)));self.send_header('Connection','close');self.end_headers();self.wfile.write(data)
     with http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler) as server:
         thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
         env=dict(os.environ,HOME=str(home),TMPDIR=str(temp),GITHUB_TOKEN='',OCEAN_INSTALLER_API_BASE=f'http://127.0.0.1:{server.server_port}/api',GIT_CONFIG_COUNT='2')
@@ -118,7 +125,9 @@ with tempfile.TemporaryDirectory(prefix='ocean-native-installer-test-') as direc
         assert before==(destination/'installation.json').read_bytes() and not (root/'escape').exists()
         state['body']=archive();invoke(prefix,True)
         assert profiles=={p:p.read_bytes() for p in profiles},'PATH block duplicated'
+        state['chunked_deps']=True
         invoke(f'2\nremove {destination}\ny\n3\nlatest\n',True)
+        state['chunked_deps']=False
         assert (destination/'bin/clang').is_file()
         assert json.loads((destination/'installation.json').read_text())['dependencies']=='bundle'
         # Declining a system package operation never invokes a real package manager.
@@ -182,11 +191,13 @@ with tempfile.TemporaryDirectory(prefix='ocean-native-installer-test-') as direc
             os.write(master,b'\r')  # Continue & fetch releases
             wait_for(b'Search:')
             os.write(master,b'1.0\r')  # fuzzy filter to 1.0.0, Enter
+            wait_for(b'installed in')
             assert proc.wait(timeout=30)==0,proc.stderr.read()
         finally:
             if proc.poll() is None:proc.kill();proc.wait()
             os.close(master)
         assert b'\x1b[?1049h' not in captured[0],'inline TUI must not enter alt screen'
+        assert b'Downloading compiler' in captured[0] and b'100%' in captured[0] and '█'.encode() in captured[0], captured[0]
         assert list(temp.iterdir())==[],list(temp.iterdir())
         tuiMeta=json.loads((tuiDest/'installation.json').read_text())
         assert tuiMeta['version']=='1.0.0' and tuiMeta['commit']==commit,tuiMeta

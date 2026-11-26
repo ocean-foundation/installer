@@ -1,0 +1,631 @@
+package main;
+import "io";
+import "os";
+import "sync";
+import "term";
+import "time";
+
+// Streaming HTTP/HTTPS file downloader with live terminal progress bar.
+// Uses the same verified libcurl CONNECT_ONLY transport pattern as stdlib net/http
+// so large release archives stream directly to disk with real-time byte progress.
+extern i32 curl_global_init(int flags);
+extern *void curl_easy_init();
+extern void curl_easy_cleanup(*void handle);
+extern i32 curl_easy_setopt(*void handle, i32 option, ...);
+extern i32 curl_easy_send(*void handle, buffer<i8> data, uint size, *uint sent);
+extern i32 curl_easy_recv(*void handle, buffer<i8> data, uint size, *uint received);
+extern *void curl_multi_init();
+extern i32 curl_multi_add_handle(*void multi, *void easy);
+extern i32 curl_multi_remove_handle(*void multi, *void easy);
+extern i32 curl_multi_cleanup(*void multi);
+extern i32 curl_multi_perform(*void multi, *i32 running);
+extern i32 curl_multi_poll(*void multi, *void extra, u32 count, i32 milliseconds, *i32 ready);
+extern *curlMsg curl_multi_info_read(*void multi, *i32 remaining);
+extern *curlVersionInfo curl_version_info(i32 age);
+
+curlOptURL: i32 = 10002;
+curlOptProxy: i32 = 10004;
+curlOptCAInfo: i32 = 10065;
+curlOptConnectOnly: i32 = 141;
+curlOptNoSignal: i32 = 99;
+curlOptVerifyPeer: i32 = 64;
+curlOptVerifyHost: i32 = 81;
+curlOptSSLVersion: i32 = 32;
+curlOptSSLOptions: i32 = 216;
+curlOptProtocols: i32 = 181;
+curlOptHTTPVersion: i32 = 84;
+curlErrAgain: i32 = 81;
+
+struct curlMsg { kind i32; easy *void; result i32; }
+struct curlVersionInfo { age i32; version *void; number u32; host *void; features i32; }
+
+downloadInitMutex: sync.Mutex;
+downloadCurlReady: bool;
+
+func initDownloadCurl() bool {
+    downloadInitMutex.Lock(); defer downloadInitMutex.Unlock();
+    if (downloadCurlReady) return true;
+    info := extern.curl_version_info(0);
+    if ((info -> int) == 0 || info.number < 476160 || (info.features & 132) != 132) return false;
+    if (extern.curl_global_init(3) != 0) return false;
+    downloadCurlReady = true;
+    return true;
+}
+
+func curlSetLong(handle *void, option i32, value int) bool {
+    if (platform == "windows") return extern.curl_easy_setopt(handle, option, value -> i32) == 0;
+    return extern.curl_easy_setopt(handle, option, value) == 0;
+}
+
+func downloadPollBudget(deadline int) i32 {
+    if (deadline == 0) return 10;
+    remaining := deadline - time.Monotonic();
+    if (remaining <= 0) return 0;
+    if (remaining >= 10000000) return 10;
+    return ((remaining + 999999) / 1000000) -> i32;
+}
+
+func checkDownloadInterrupt(deadline int) {
+    require(!httpCancel.Canceled(), "download cancelled");
+    if (deadline > 0) require(time.Monotonic() < deadline, "download timeout exceeded");
+}
+
+struct parsedURL { host string; port string; path string; authority string; }
+
+func parseDownloadURL(url string) parsedURL {
+    prefix := 7; portDefault := "80";
+    if (starts(url, "https://")) { prefix = 8; portDefault = "443"; }
+    else require(starts(url, "http://"), "download requires http:// or https:// URL");
+    rest := url[prefix:]; end := len(rest);
+    for (i, c := range rest) { if (c == '/' || c == '?' || c == '#') { end = i; break; } }
+    authority := rest[:end]; host := authority; port := portDefault;
+    colon := index(authority, ":");
+    if (colon >= 0) { host = authority[:colon]; port = authority[colon + 1:]; }
+    require(len(host) > 0 && index(host, "@") < 0 && index(host, "[") < 0, "invalid download host");
+    path := rest[end:];
+    fragment := index(path, "#");
+    if (fragment >= 0) path = path[:fragment];
+    if (len(path) == 0 || path[0] == '?') path = "/" + path;
+    return parsedURL{host, port, path, authority};
+}
+
+func parseNonNegInt(text string) int {
+    require(len(text) > 0, "invalid HTTP numeric header");
+    for (_, c := range text) require(c >= '0' && c <= '9', "invalid HTTP numeric header");
+    parsed := io.ParseInt(text);
+    require(!parsed.hasError(), "invalid HTTP numeric header");
+    return parsed.unwrap();
+}
+
+struct responseHead {
+    statusCode int;
+    location string;
+    contentLength int; // -1 if absent
+    chunked bool;
+}
+
+func parseResponseHead(block string) responseHead {
+    lineEnd := index(block, "\r\n");
+    line := lineEnd < 0 ? block : block[:lineEnd];
+    require(len(line) >= 12 && (starts(line, "HTTP/1.1 ") || starts(line, "HTTP/1.0 ")), "invalid HTTP status line");
+    require(len(line) == 12 || line[12] == ' ', "invalid HTTP status line");
+    code := parseNonNegInt(line[9:12]);
+    require(code >= 100 && code <= 599, "invalid HTTP status code");
+    head := responseHead{statusCode: code, contentLength: -1};
+    if (lineEnd < 0) return head;
+    pos := lineEnd + 2;
+    hasLength := false;
+    for (pos < len(block)) {
+        next := index(block[pos:], "\r\n");
+        entry := next < 0 ? block[pos:] : block[pos:pos + next];
+        pos = next < 0 ? len(block) : pos + next + 2;
+        if (entry == "") continue;
+        colon := index(entry, ":");
+        require(colon > 0, "invalid HTTP response header");
+        key := asciiLower(trim(entry[:colon]));
+        val := trim(entry[colon + 1:]);
+        if (key == "location" && head.location == "") head.location = val;
+        if (key == "content-length") {
+            n := parseNonNegInt(val);
+            if (hasLength) require(n == head.contentLength, "conflicting Content-Length headers");
+            head.contentLength = n;
+            hasLength = true;
+        }
+        if (key == "transfer-encoding") {
+            require(!head.chunked && asciiLower(val) == "chunked", "unsupported Transfer-Encoding");
+            head.chunked = true;
+        }
+    }
+    require(!(head.chunked && hasLength), "conflicting Transfer-Encoding and Content-Length");
+    return head;
+}
+
+// Progress formatting and rendering helpers.
+func stdoutIsTTY() bool {
+    out := os.Stdout();
+    if (out.hasError()) return false;
+    res := term.IsTerminal(out.unwrap());
+    return !res.hasError() && res.unwrap();
+}
+
+func stdoutWidth() int {
+    out := os.Stdout();
+    if (out.hasError()) return 80;
+    size := term.GetSize(out.unwrap());
+    if (size.hasError() || size.unwrap().Width <= 0) return 80;
+    return size.unwrap().Width;
+}
+
+func formatBytes(bytes int) string {
+    if (bytes < 0) bytes = 0;
+    if (bytes < 1024) return io.Sprint(bytes) + " B";
+    if (bytes < 1024 * 1024) {
+        tenths := (bytes * 10 + 512) / 1024;
+        return io.Sprint(tenths / 10) + "." + io.Sprint(tenths % 10) + " KB";
+    }
+    if (bytes < 1024 * 1024 * 1024) {
+        tenths := (bytes * 10 + 524288) / 1048576;
+        return io.Sprint(tenths / 10) + "." + io.Sprint(tenths % 10) + " MB";
+    }
+    hundredths := (bytes * 100 + 536870912) / 1073741824;
+    frac := hundredths % 100;
+    fracStr := frac < 10 ? "0" + io.Sprint(frac) : io.Sprint(frac);
+    return io.Sprint(hundredths / 100) + "." + fracStr + " GB";
+}
+
+func formatDuration(seconds int) string {
+    if (seconds < 0) seconds = 0;
+    if (seconds < 60) return io.Sprint(seconds) + "s";
+    mins := seconds / 60;
+    secs := seconds % 60;
+    if (mins < 60) {
+        s := secs < 10 ? "0" + io.Sprint(secs) : io.Sprint(secs);
+        return io.Sprint(mins) + "m" + s + "s";
+    }
+    hours := mins / 60;
+    remMins := mins % 60;
+    m := remMins < 10 ? "0" + io.Sprint(remMins) : io.Sprint(remMins);
+    return io.Sprint(hours) + "h" + m + "m";
+}
+
+func repeatText(unit string, count int) string {
+    out := "";
+    for (i := 0; i < count; i++) out += unit;
+    return out;
+}
+
+func padLeft(text string, width int) string {
+    out := text;
+    for (len(out) < width) out = " " + out;
+    return out;
+}
+
+func renderProgressBar(label string, downloaded int, total int, elapsedNs int, width int, tick int, done bool, color bool) string {
+    if (width < 40) width = 40;
+    bytesPerSec := 0;
+    elapsedMs := elapsedNs / 1000000;
+    if (elapsedMs >= 50 && downloaded > 0) bytesPerSec = (downloaded * 1000) / elapsedMs;
+
+    prefixPlain := "  " + label + "  ";
+    minBarWidth := 12;
+
+    statsPlain := "";
+    statsStyled := "";
+    if (total >= 0) {
+        pct := 100;
+        if (!done) {
+            pct = total == 0 ? 100 : (downloaded * 100) / total;
+            if (pct > 100) pct = 100;
+            if (pct < 0) pct = 0;
+        }
+        pctStr := padLeft(io.Sprint(pct), 3) + "%";
+        sizeStr := done ? formatBytes(total) : (formatBytes(downloaded) + " / " + formatBytes(total));
+        statsPlain = " " + pctStr + "  " + sizeStr;
+        statsStyled = " " + (color ? "\x1b[1m" + pctStr + "\x1b[0m" : pctStr) + "  " + sizeStr;
+        if (bytesPerSec > 0) {
+            spd := "  " + formatBytes(bytesPerSec) + "/s";
+            if (len(prefixPlain) + 2 + minBarWidth + len(statsPlain) + len(spd) < width) {
+                statsPlain += spd;
+                statsStyled += color ? "\x1b[2m" + spd + "\x1b[0m" : spd;
+            }
+        }
+        if (done) {
+            if (len(prefixPlain) + 2 + minBarWidth + len(statsPlain) + 6 < width) {
+                statsPlain += "  done";
+                statsStyled += color ? "  \x1b[1;32mdone\x1b[0m" : "  done";
+            }
+        } else if (bytesPerSec > 0 && total > downloaded) {
+            etaSec := (total - downloaded + bytesPerSec - 1) / bytesPerSec;
+            eta := "  ETA " + formatDuration(etaSec);
+            if (len(prefixPlain) + 2 + minBarWidth + len(statsPlain) + len(eta) < width) {
+                statsPlain += eta;
+                statsStyled += color ? "\x1b[2m" + eta + "\x1b[0m" : eta;
+            }
+        }
+    } else {
+        sizeStr := formatBytes(downloaded);
+        statsPlain = " " + sizeStr;
+        statsStyled = " " + sizeStr;
+        if (bytesPerSec > 0) {
+            spd := "  " + formatBytes(bytesPerSec) + "/s";
+            if (len(prefixPlain) + 2 + minBarWidth + len(statsPlain) + len(spd) < width) {
+                statsPlain += spd;
+                statsStyled += color ? "\x1b[2m" + spd + "\x1b[0m" : spd;
+            }
+        }
+        if (done) {
+            if (len(prefixPlain) + 2 + minBarWidth + len(statsPlain) + 6 < width) {
+                statsPlain += "  done";
+                statsStyled += color ? "  \x1b[1;32mdone\x1b[0m" : "  done";
+            }
+        }
+    }
+
+    overhead := len(prefixPlain) + 2 + len(statsPlain);
+    barWidth := width - overhead - 1;
+    if (barWidth > 30) barWidth = 30;
+    if (barWidth < 8) barWidth = 8;
+
+    bar := "";
+    if (total >= 0 || done) {
+        filled := barWidth;
+        if (!done) {
+            filled = total == 0 ? barWidth : (downloaded * barWidth) / total;
+            if (filled > barWidth) filled = barWidth;
+            if (filled < 0) filled = 0;
+        }
+        empty := barWidth - filled;
+        if (color) {
+            fillColor := done ? "\x1b[32m" : "\x1b[36m";
+            bar = fillColor + repeatText("█", filled) + "\x1b[0m\x1b[2m" + repeatText("░", empty) + "\x1b[0m";
+        } else {
+            bar = repeatText("█", filled) + repeatText("░", empty);
+        }
+    } else {
+        block := barWidth / 4;
+        if (block < 3) block = 3;
+        span := barWidth - block;
+        pos := 0;
+        if (span > 0) {
+            cycle := span * 2;
+            step := tick % cycle;
+            pos = step <= span ? step : cycle - step;
+        }
+        right := barWidth - pos - block;
+        if (color) {
+            bar = "\x1b[2m" + repeatText("░", pos) + "\x1b[0m\x1b[36m" + repeatText("█", block) + "\x1b[0m\x1b[2m" + repeatText("░", right) + "\x1b[0m";
+        } else {
+            bar = repeatText("░", pos) + repeatText("█", block) + repeatText("░", right);
+        }
+    }
+
+    return prefixPlain + "[" + bar + "]" + statsStyled;
+}
+
+struct progressTracker {
+    label string;
+    total int;
+    downloaded int;
+    startNs int;
+    lastRenderNs int;
+    tick int;
+    tty bool;
+    drawn bool;
+}
+
+func newProgressTracker(label string, total int) progressTracker {
+    nowNs := time.Monotonic();
+    return progressTracker{
+        label: label,
+        total: total,
+        downloaded: 0,
+        startNs: nowNs,
+        lastRenderNs: 0,
+        tick: 0,
+        tty: stdoutIsTTY(),
+        drawn: false
+    };
+}
+
+func (p *progressTracker) start() {
+    if (p.tty) {
+        p.render(false, true);
+    } else {
+        if (p.total > 0) io.Println(p.label, " (", formatBytes(p.total), ")...");
+        else io.Println(p.label, "...");
+    }
+}
+
+func (p *progressTracker) add(n int) {
+    p.downloaded += n;
+    if (p.tty) p.render(false, false);
+}
+
+func (p *progressTracker) render(done bool, force bool) {
+    nowNs := time.Monotonic();
+    if (!force && !done && p.lastRenderNs > 0 && nowNs - p.lastRenderNs < 50 * time.Millisecond) return;
+    p.lastRenderNs = nowNs;
+    p.tick++;
+    line := renderProgressBar(p.label, p.downloaded, p.total, nowNs - p.startNs, stdoutWidth(), p.tick, done, true);
+    if (done) {
+        io.Print("\r\x1b[K" + line + "\n");
+        p.drawn = false;
+    } else {
+        io.Print("\r\x1b[K" + line);
+        p.drawn = true;
+    }
+}
+
+func (p *progressTracker) finish() {
+    if (p.tty) {
+        p.render(true, true);
+    }
+}
+
+func (p *progressTracker) abort() {
+    if (p.tty && p.drawn) {
+        io.Print("\n");
+        p.drawn = false;
+    }
+}
+
+// Streaming chunked transfer-encoding decoder writing directly to an os.File.
+struct chunkDecoder {
+    state int; // 0=size line, 1=chunk data, 2=chunk CRLF, 3=trailers, 4=done
+    buf string;
+    remaining int;
+    written int;
+    limit int;
+}
+
+func parseHexSize(line string) int {
+    semi := index(line, ";");
+    if (semi >= 0) line = line[:semi];
+    line = asciiLower(trim(line));
+    require(len(line) > 0, "invalid HTTP chunk size");
+    size := 0;
+    for (_, c := range line) {
+        n := index("0123456789abcdef", []i8{c} -> string);
+        require(n >= 0 && size <= (1073741824 - n) / 16, "invalid HTTP chunk size");
+        size = size * 16 + n;
+    }
+    return size;
+}
+
+func (d *chunkDecoder) feed(data string, out os.File, progress *progressTracker) {
+    d.buf += data;
+    for (;;) {
+        if (d.state == 0) {
+            end := index(d.buf, "\r\n");
+            if (end < 0) { require(len(d.buf) <= 4096, "HTTP chunk size line too long"); return; }
+            size := parseHexSize(d.buf[:end]);
+            d.buf = d.buf[end + 2:];
+            if (size == 0) { d.state = 3; continue; }
+            d.remaining = size;
+            d.state = 1;
+        } else if (d.state == 1) {
+            if (len(d.buf) == 0) return;
+            take := len(d.buf) < d.remaining ? len(d.buf) : d.remaining;
+            require(take <= d.limit - d.written, "download exceeds size limit");
+            out.Write(d.buf[:take]).unwrap();
+            d.written += take;
+            progress.add(take);
+            d.buf = d.buf[take:];
+            d.remaining -= take;
+            if (d.remaining == 0) d.state = 2;
+        } else if (d.state == 2) {
+            if (len(d.buf) < 2) return;
+            require(d.buf[:2] == "\r\n", "missing HTTP chunk terminator");
+            d.buf = d.buf[2:];
+            d.state = 0;
+        } else if (d.state == 3) {
+            end := index(d.buf, "\r\n");
+            if (end < 0) { require(len(d.buf) <= 65536, "HTTP trailers too large"); return; }
+            line := d.buf[:end];
+            d.buf = d.buf[end + 2:];
+            if (line == "") {
+                require(len(d.buf) == 0, "trailing data after HTTP chunked body");
+                d.state = 4;
+                return;
+            }
+        } else {
+            require(len(d.buf) == 0, "trailing data after HTTP chunked body");
+            return;
+        }
+    }
+}
+
+func downloadFile(url string, destination string, limit int, label string) {
+    require(initDownloadCurl(), "libcurl 7.68+ with TLS and asynchronous DNS required");
+    timeoutNs := (limit > 32 * 1024 * 1024 ? 600 : 120) * time.Second;
+    deadline := time.Monotonic() + timeoutNs;
+    for (redirects := 0; redirects < 10; redirects++) {
+        checkDownloadInterrupt(deadline);
+        require(allowedURL(url), "download requires HTTPS");
+        t := parseDownloadURL(url);
+        redirect, nextURL := downloadAttempt(url, t, destination, limit, label, deadline);
+        if (!redirect) return;
+        url = nextURL;
+    }
+    panic "too many download redirects";
+}
+
+func downloadAttempt(url string, t parsedURL, destination string, limit int, label string, deadline int) (bool, string) {
+    easy := extern.curl_easy_init();
+    require((easy -> int) != 0, "download transport allocation failed");
+    defer extern.curl_easy_cleanup(easy);
+
+    urlBytes := (url + "\0") -> []i8;
+    require(
+        extern.curl_easy_setopt(easy, curlOptURL, urlBytes.data) == 0 &&
+        extern.curl_easy_setopt(easy, curlOptProxy, "\0".data) == 0 &&
+        curlSetLong(easy, curlOptConnectOnly, 1) &&
+        curlSetLong(easy, curlOptNoSignal, 1) &&
+        curlSetLong(easy, curlOptVerifyPeer, 1) &&
+        curlSetLong(easy, curlOptVerifyHost, 2) &&
+        curlSetLong(easy, curlOptSSLVersion, 6) &&
+        curlSetLong(easy, curlOptProtocols, 3) &&
+        curlSetLong(easy, curlOptHTTPVersion, 2),
+        "download transport setup failed"
+    );
+    if (platform == "windows" && extern.curl_version_info(0).number >= 476928) {
+        require(
+            curlSetLong(easy, curlOptSSLOptions, 16) &&
+            extern.curl_easy_setopt(easy, curlOptCAInfo, zero(*void)) == 0,
+            "native root CA setup failed"
+        );
+    }
+
+    multi := extern.curl_multi_init();
+    require((multi -> int) != 0, "download transport allocation failed");
+    defer extern.curl_multi_cleanup(multi);
+    require(extern.curl_multi_add_handle(multi, easy) == 0, "cannot start download connection");
+    defer extern.curl_multi_remove_handle(multi, easy);
+
+    running: i32 = 1;
+    for (running != 0) {
+        checkDownloadInterrupt(deadline);
+        require(extern.curl_multi_perform(multi, &running) == 0, "download connection failed");
+        if (running != 0) {
+            ready: i32;
+            require(extern.curl_multi_poll(multi, zero(*void), 0, downloadPollBudget(deadline), &ready) == 0, "download connection poll failed");
+        }
+    }
+    remaining: i32; finished := false;
+    for (;;) {
+        msg := extern.curl_multi_info_read(multi, &remaining);
+        if ((msg -> int) == 0) break;
+        if (msg.kind == 1) {
+            require(msg.result == 0, "download connection or TLS verification failed");
+            finished = true;
+        }
+    }
+    require(finished, "incomplete download connection");
+
+    wire := "GET " + t.path + " HTTP/1.1\r\nHost: " + t.authority + "\r\nConnection: close\r\nUser-Agent: ocean-installer\r\n";
+    if (apiBase != "" && starts(url, apiBase + "/")) {
+        wire += "Accept: application/vnd.github+json\r\n";
+        token := environment("GITHUB_TOKEN");
+        if (token != "" && starts(apiBase, "https://")) wire += "Authorization: Bearer " + token + "\r\n";
+    }
+    wire += "\r\n";
+
+    wireBytes := wire -> []i8;
+    sent := 0;
+    for (sent < len(wireBytes)) {
+        checkDownloadInterrupt(deadline);
+        size := len(wireBytes) - sent;
+        if (size > 65536) size = 65536;
+        data := (&wireBytes[sent]) -> (buffer<i8>);
+        count: uint;
+        status := extern.curl_easy_send(easy, data, size -> uint, &count);
+        if (status == curlErrAgain) { time.Sleep(downloadPollBudget(deadline) -> int * time.Millisecond); continue; }
+        require(status == 0 && count > 0, "download request send failed");
+        sent += count -> int;
+    }
+
+    // Receive response headers (skipping any 1xx informational responses).
+    headerBuf := "";
+    chunk: [16384]i8;
+    head: responseHead;
+    bodyStart := "";
+    infoDepth := 0;
+    for (;;) {
+        sep := index(headerBuf, "\r\n\r\n");
+        if (sep >= 0) {
+            head = parseResponseHead(headerBuf[:sep]);
+            bodyStart = headerBuf[sep + 4:];
+            if (head.statusCode >= 100 && head.statusCode < 200) {
+                require(head.statusCode != 101 && infoDepth < 16, "unsupported informational HTTP response");
+                infoDepth++;
+                headerBuf = bodyStart;
+                continue;
+            }
+            break;
+        }
+        require(len(headerBuf) <= 65536, "HTTP response headers too large");
+        checkDownloadInterrupt(deadline);
+        count: uint;
+        status := extern.curl_easy_recv(easy, chunk.data, 16384, &count);
+        if (status == curlErrAgain) { time.Sleep(downloadPollBudget(deadline) -> int * time.Millisecond); continue; }
+        require(status == 0 && count > 0, "download receive failed while reading headers");
+        headerBuf += chunk[:count -> int] -> string;
+    }
+
+    if (head.statusCode >= 300 && head.statusCode <= 399) {
+        require(head.location != "", "redirect has no Location");
+        return true, redirectURL(url, head.location);
+    }
+    require(head.statusCode >= 200 && head.statusCode < 300, "HTTP " + io.Sprint(head.statusCode) + " fetching " + url);
+    if (head.contentLength >= 0) require(head.contentLength <= limit, "download exceeds size limit");
+
+    outFile := os.Open(destination, os.FileMode.BinaryWrite).unwrap();
+    defer outFile.Close();
+
+    progress := newProgressTracker(label, head.contentLength);
+    completed := false;
+    defer func() { if (!completed) progress.abort(); }();
+    progress.start();
+
+    if (head.chunked) {
+        decoder := chunkDecoder{limit: limit};
+        if (len(bodyStart) > 0) decoder.feed(bodyStart, outFile, &progress);
+        for (decoder.state != 4) {
+            checkDownloadInterrupt(deadline);
+            count: uint;
+            status := extern.curl_easy_recv(easy, chunk.data, 16384, &count);
+            if (status == curlErrAgain) { time.Sleep(downloadPollBudget(deadline) -> int * time.Millisecond); continue; }
+            require(status == 0, "download receive failed");
+            if (count == 0) break;
+            decoder.feed(chunk[:count -> int] -> string, outFile, &progress);
+        }
+        require(decoder.state == 4, "truncated chunked download");
+    } else if (head.contentLength >= 0) {
+        received := 0;
+        if (len(bodyStart) > 0) {
+            require(len(bodyStart) <= head.contentLength, "download body length mismatch");
+            outFile.Write(bodyStart).unwrap();
+            received += len(bodyStart);
+            progress.add(len(bodyStart));
+        }
+        for (received < head.contentLength) {
+            checkDownloadInterrupt(deadline);
+            count: uint;
+            status := extern.curl_easy_recv(easy, chunk.data, 16384, &count);
+            if (status == curlErrAgain) { time.Sleep(downloadPollBudget(deadline) -> int * time.Millisecond); continue; }
+            require(status == 0, "download receive failed");
+            if (count == 0) break;
+            n := count -> int;
+            require(n <= head.contentLength - received, "download body length mismatch");
+            outFile.Write(chunk[:n] -> string).unwrap();
+            received += n;
+            progress.add(n);
+        }
+        require(received == head.contentLength, "truncated download");
+    } else {
+        received := 0;
+        if (len(bodyStart) > 0) {
+            require(len(bodyStart) <= limit, "download exceeds size limit");
+            outFile.Write(bodyStart).unwrap();
+            received += len(bodyStart);
+            progress.add(len(bodyStart));
+        }
+        for (;;) {
+            checkDownloadInterrupt(deadline);
+            count: uint;
+            status := extern.curl_easy_recv(easy, chunk.data, 16384, &count);
+            if (status == curlErrAgain) { time.Sleep(downloadPollBudget(deadline) -> int * time.Millisecond); continue; }
+            require(status == 0, "download receive failed");
+            if (count == 0) break;
+            n := count -> int;
+            require(n <= limit - received, "download exceeds size limit");
+            outFile.Write(chunk[:n] -> string).unwrap();
+            received += n;
+            progress.add(n);
+        }
+    }
+
+    progress.finish();
+    completed = true;
+    return false, "";
+}

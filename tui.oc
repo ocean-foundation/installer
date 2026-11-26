@@ -34,6 +34,44 @@ func editTextInput(text string, event tui.KeyMsg) string {
     return text;
 }
 
+// Inline term/tui redraws do not emit per-line erase-to-EOL sequences and strip
+// non-SGR CSI escapes from View(), so pad non-final lines with plain spaces up
+// to width - 1 to overwrite stale characters/cursors when a line shrinks.
+func padLine(line string, width int) string {
+    target := width - 1;
+    if (target <= 0) return line;
+    visible := 0;
+    for (i := 0; i < len(line);) {
+        b := ((line[i] -> u8) -> int);
+        if (b == 27 && i + 1 < len(line) && line[i + 1] == '[') {
+            i += 2;
+            for (i < len(line) && line[i] != 'm') i++;
+            if (i < len(line)) i++;
+            continue;
+        }
+        if ((b & 192) != 128) visible++;
+        i++;
+    }
+    if (visible >= target) return line;
+    spaces := []i8{};
+    for (i := visible; i < target; i++) spaces.append(' ');
+    return line + "\x1b[0m" + (spaces -> string);
+}
+
+func padViewLines(view string, width int) string {
+    if (width <= 1) return view;
+    out := "";
+    start := 0;
+    for (i := 0; i < len(view); i++) {
+        if (view[i] == '\n') {
+            out += padLine(view[start:i], width) + "\n";
+            start = i + 1;
+        }
+    }
+    out += view[start:];
+    return out;
+}
+
 func printSection(step int, total int, title string) {
     if (total > 0) {
         io.Println("\n\x1b[1;36m[" + io.Sprint(step) + "/" + io.Sprint(total) + "]\x1b[0m \x1b[1m" + title + "\x1b[0m");
@@ -140,6 +178,7 @@ struct inputModel {
     expected string; // used when mode == "exact"
     normalized string;
     err string;
+    width int;
     confirmed bool;
     cancelled bool;
 }
@@ -148,6 +187,8 @@ func (model *inputModel) Init() tui.Cmd { return tui.NoCmd; }
 
 func (model *inputModel) Update(message tui.Msg) (tui.Model, tui.Cmd) {
     switch (event := message.(type)) {
+        case tui.WindowSizeMsg:
+            model.width = event.Width;
         case tui.EOFMsg:
             model.cancelled = true;
             return model, tui.Quit;
@@ -187,13 +228,14 @@ func (model *inputModel) View() string {
     out += "  \x1b[1;36m> \x1b[0m" + model.value + "\x1b[7m \x1b[0m";
     if (model.err != "") out += "\n\x1b[31m  Error: " + model.err + "\x1b[0m";
     out += "\n\x1b[2m  Enter Confirm · Ctrl+U Clear · Esc/Ctrl+C Cancel\x1b[0m";
-    return out;
+    return padViewLines(out, model.width);
 }
 
 func runPathInputTUI() string {
     model := inputModel{
         prompt: "Full installation directory (including ocean folder):",
-        mode: "path"
+        mode: "path",
+        width: 80
     };
     program := tui.NewProgram(&model, tui.Options{AltScreen: false, Mouse: false});
     program.Run().unwrap();
@@ -206,7 +248,8 @@ func runReplaceInputTUI(destination string) {
     model := inputModel{
         prompt: "Type \x1b[1m" + expected + "\x1b[0m to remove and replace this installation:",
         mode: "exact",
-        expected: expected
+        expected: expected,
+        width: 80
     };
     program := tui.NewProgram(&model, tui.Options{AltScreen: false, Mouse: false});
     program.Run().unwrap();
@@ -695,7 +738,7 @@ func (model *versionModel) View() string {
     }
     if (model.err != "") out += "\x1b[31m  " + model.err + "\x1b[0m\n";
     out += "\x1b[2m  Type to filter · ←/→ Edit · ↑/↓ Navigate · Enter Install · Esc/Ctrl+C Cancel\x1b[0m";
-    return out;
+    return padViewLines(out, model.width);
 }
 
 func runVersionTUI(releases []Release) Release {
