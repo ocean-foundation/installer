@@ -21,7 +21,6 @@ jobs:
       contents: write
     env:
       OCEAN_REPO: ocean-foundation/ocean
-      OCEAN_TARGET_DIR: ${{ runner.temp }}/ocean-targets
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,6 +61,7 @@ jobs:
           OCEAN_SRC: ${{ github.workspace }}/.ocean-stdlib
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          export OCEAN_TARGET_DIR="$RUNNER_TEMP/ocean-targets"
           targets=(
             x86_64-linux aarch64-linux riscv64-linux
             x86_64-macos aarch64-macos
