@@ -15,7 +15,7 @@ concurrency:
 jobs:
   release:
     if: github.event.deleted == false
-    runs-on: macos-15
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: write
@@ -32,8 +32,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag=$(gh api "repos/$OCEAN_REPO/releases/latest" --jq .tag_name)
-          archive="ocean_${tag}_aarch64-macos.tar"
-          checksums=SHA256SUMS_aarch64-macos.txt
+          archive="ocean_${tag}_x86_64-linux.tar"
+          checksums=SHA256SUMS_x86_64-linux.txt
           prefix="$RUNNER_TEMP/ocean"
           mkdir -p "$prefix/bin"
           cd "$prefix"
@@ -62,14 +62,13 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           export OCEAN_TARGET_DIR="$RUNNER_TEMP/ocean-targets"
+          ocean target --all
+          mkdir -p dist
           targets=(
             x86_64-linux aarch64-linux riscv64-linux
             x86_64-macos aarch64-macos
             x86_64-windows aarch64-windows
           )
-          ocean target "${targets[@]}"
-
-          mkdir -p dist
           for target in "${targets[@]}"; do
             os=${target#*-}
             staging="$RUNNER_TEMP/installer/$target"
